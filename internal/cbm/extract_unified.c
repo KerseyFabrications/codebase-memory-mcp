@@ -126,6 +126,19 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
+    // C++/CUDA out-of-line method definition (`Foo::Bar` in a .cc, with or without a
+    // surrounding `namespace {}` block): the class body lives declaration-only in a
+    // header, so there is no class scope on the walk stack. Scope the QN to its class
+    // (matching the defs extractor) so a call inside the body attributes to the
+    // Method node instead of the File node.
+    if (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) {
+        const char *ool = cbm_cpp_out_of_line_method_qn(ctx->arena, node, ctx->source, ctx->project,
+                                                        ctx->rel_path, name);
+        if (ool) {
+            return ool;
+        }
+    }
+
     if (state->enclosing_class_qn) {
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }

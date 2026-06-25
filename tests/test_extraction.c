@@ -64,6 +64,52 @@ static CBMFileResult *extract(const char *src, CBMLanguage lang, const char *pro
     return r;
 }
 
+/* Issue #438 follow-up: a call inside a C++ out-of-line method definition
+ * (`void Foo::Bar() { Baz(); }`) must attribute to the enclosing Method, whose QN
+ * the defs extractor scopes to its class (`t.path.Foo.Bar`). The calls extractor
+ * computes enclosing_func_qn independently, so the two must agree byte-for-byte or
+ * the pipeline's exact-QN match drops the call to the File node. This must hold
+ * regardless of any surrounding `namespace {}` block (namespace context is not part
+ * of the C++ QN scheme). Guards the call-side reconstruction of the class qualifier. */
+TEST(cpp_out_of_line_enclosing_qn) {
+    struct {
+        const char *src;
+        const char *path;
+        const char *want_enc; /* expected call enclosing_func_qn == Method def qn */
+    } cases[] = {
+        {"using namespace mylib;\nvoid Foo::Bar() { Baz(); }\n", "g.cc", "t.g.Foo.Bar"},
+        {"namespace mylib { void Foo::Bar() { Baz(); } }\n", "b.cc", "t.b.Foo.Bar"},
+        {"namespace mylib { namespace inner { void Foo::Bar() { Baz(); } } }\n", "n.cc",
+         "t.n.Foo.Bar"},
+    };
+    for (int c = 0; c < 3; c++) {
+        CBMFileResult *r = extract(cases[c].src, CBM_LANG_CPP, "t", cases[c].path);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        /* The out-of-line def is promoted to a class-scoped Method. */
+        int saw_method = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            if (strcmp(r->defs.items[i].label, "Method") == 0 &&
+                strcmp(r->defs.items[i].qualified_name, cases[c].want_enc) == 0) {
+                saw_method = 1;
+            }
+        }
+        ASSERT(saw_method);
+        /* The Baz() call's enclosing QN matches that Method QN exactly. */
+        int saw_baz = 0;
+        for (int i = 0; i < r->calls.count; i++) {
+            if (strcmp(r->calls.items[i].callee_name, "Baz") == 0) {
+                saw_baz = 1;
+                ASSERT_NOT_NULL(r->calls.items[i].enclosing_func_qn);
+                ASSERT(strcmp(r->calls.items[i].enclosing_func_qn, cases[c].want_enc) == 0);
+            }
+        }
+        ASSERT(saw_baz);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Group A: OOP Languages
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3175,6 +3221,7 @@ SUITE(extraction) {
     RUN_TEST(c_caller_attribution);
     RUN_TEST(cpp_out_of_line_method_caller_attribution);
     RUN_TEST(cpp_out_of_line_ctor_dtor_caller_attribution);
+    RUN_TEST(cpp_out_of_line_enclosing_qn);
     RUN_TEST(wolfram_parse);
     RUN_TEST(wolfram_import);
     RUN_TEST(wolfram_nested_def);

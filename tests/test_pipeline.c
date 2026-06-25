@@ -13,6 +13,7 @@
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include <sqlite3.h> // raw edge-source query for out-of-line call attribution (#438 follow-up)
 
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,31 @@ static void teardown_test_repo(void) {
     if (g_tmpdir[0])
         rm_rf(g_tmpdir);
     g_tmpdir[0] = '\0';
+}
+
+/* Create an empty temp repo (caller writes files via write_repo_file). */
+static int setup_empty_repo(void) {
+    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
+    return cbm_mkdtemp(g_tmpdir) ? 0 : -1;
+}
+
+/* Write one file (relative path under g_tmpdir), creating parent dirs. */
+static int write_repo_file(const char *rel, const char *content) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", g_tmpdir, rel);
+    char *slash = strrchr(path, '/');
+    if (slash && slash > path + strlen(g_tmpdir)) {
+        *slash = '\0';
+        cbm_mkdir_p(path, 0755);
+        *slash = '/';
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return -1;
+    }
+    fputs(content, f);
+    fclose(f);
+    return 0;
 }
 
 /* ── Lifecycle tests ─────────────────────────────────────────────── */
@@ -903,6 +929,79 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
 
+    teardown_test_repo();
+    PASS();
+}
+
+/* Return the label of the node that SOURCES the CALLS edge to `callee`, where the
+ * source node's QN contains `src_stem` (the defining file's stem). Caller-owned
+ * buffer. Returns -1 if no such CALLS edge, else CBM_STORE_OK with label copied. */
+static int calls_source_label(sqlite3 *db, const char *callee, const char *src_stem, char *out,
+                              size_t out_sz) {
+    const char *sql = "SELECT src.label FROM edges e "
+                      "JOIN nodes src ON e.source_id = src.id "
+                      "JOIN nodes dst ON e.target_id = dst.id "
+                      "WHERE e.type='CALLS' AND dst.name=?1 "
+                      "AND src.qualified_name LIKE '%' || ?2 || '%' LIMIT 1;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, callee, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, src_stem, -1, SQLITE_STATIC);
+    int found = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *lbl = sqlite3_column_text(st, 0);
+        snprintf(out, out_sz, "%s", lbl ? (const char *)lbl : "");
+        found = 0;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Issue #438 follow-up (surfaced in #463 review): a call inside a C++ out-of-line
+ * method definition must attribute to the enclosing Method node, not fall back to
+ * the File node — including when the definition is wrapped in a `namespace {}`
+ * block. Covers the same call written at global scope (`using namespace`) and
+ * inside a namespace block; both must source from a Method node after the fix. */
+TEST(pipeline_cpp_out_of_line_call_attribution) {
+    if (setup_empty_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    /* Baz has an inline body so it is a graph node the Baz() calls can resolve to;
+     * BarGlobal/BarBlock are declared here and defined out-of-line in the .cc files. */
+    write_repo_file("foo.h", "namespace mylib { class Foo { public:\n"
+                             "  void BarGlobal(); void BarBlock(); void Baz() {} }; }\n");
+    /* Out-of-line def at global scope via `using namespace`. */
+    write_repo_file("foo_global.cc", "#include \"foo.h\"\n"
+                                     "using namespace mylib;\n"
+                                     "void Foo::BarGlobal() { Baz(); }\n");
+    /* Identical out-of-line def, but wrapped in a namespace block (the bug). */
+    write_repo_file("foo_block.cc", "#include \"foo.h\"\n"
+                                    "namespace mylib { void Foo::BarBlock() { Baz(); } }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_ool.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+
+    /* Both forms' Baz() calls must source from a Method node, not File/Module. */
+    char glob_lbl[64] = {0}, block_lbl[64] = {0};
+    int g_ok = calls_source_label(db, "Baz", "foo_global", glob_lbl, sizeof(glob_lbl));
+    int b_ok = calls_source_label(db, "Baz", "foo_block", block_lbl, sizeof(block_lbl));
+
+    ASSERT_EQ(g_ok, 0);
+    ASSERT_STR_EQ(glob_lbl, "Method");
+    ASSERT_EQ(b_ok, 0);
+    ASSERT_STR_EQ(block_lbl, "Method");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
     teardown_test_repo();
     PASS();
 }
@@ -6177,6 +6276,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_cpp_out_of_line_call_attribution);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);

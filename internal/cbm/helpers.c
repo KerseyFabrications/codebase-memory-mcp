@@ -807,6 +807,61 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     return NULL;
 }
 
+char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode func_node, const char *source) {
+    // Descend the declarator chain to its qualified_identifier, if any.
+    TSNode qid = {0};
+    TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
+        const char *dk = ts_node_type(decl);
+        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
+            qid = decl;
+            break;
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        if (ts_node_is_null(inner)) {
+            break;
+        }
+        decl = inner;
+    }
+    if (ts_node_is_null(qid)) {
+        return NULL;
+    }
+    // The qualified_identifier's `scope` is the parent. For a nested scope
+    // (`ns::Foo`) descend through its `name` field to the innermost segment so
+    // the direct parent ("Foo") is returned, not the outer namespace.
+    TSNode scope = ts_node_child_by_field_name(qid, TS_FIELD("scope"));
+    if (ts_node_is_null(scope)) {
+        return NULL;
+    }
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT; depth++) {
+        const char *sk = ts_node_type(scope);
+        if (strcmp(sk, "qualified_identifier") != 0 && strcmp(sk, "scoped_identifier") != 0) {
+            break;
+        }
+        TSNode name = ts_node_child_by_field_name(scope, TS_FIELD("name"));
+        if (ts_node_is_null(name)) {
+            break;
+        }
+        scope = name;
+    }
+    char *text = cbm_node_text(a, scope, source);
+    return (text && text[0]) ? text : NULL;
+}
+
+const char *cbm_cpp_out_of_line_method_qn(CBMArena *a, TSNode func_node, const char *source,
+                                          const char *project, const char *rel_path,
+                                          const char *name) {
+    char *scope = cbm_cpp_out_of_line_parent_class(a, func_node, source);
+    if (!scope || !scope[0]) {
+        return NULL;
+    }
+    const char *class_qn = cbm_fqn_compute(a, project, rel_path, scope);
+    return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+}
+
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path,
                                   const char *module_qn) {
@@ -835,6 +890,19 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
                 }
             }
             cur = ts_node_parent(cur);
+        }
+    }
+
+    // C++/CUDA out-of-line method definition (`Foo::Bar` in a .cc, with or without
+    // a surrounding `namespace {}` block): the class body lives declaration-only in
+    // a header, so there is no enclosing class AST node for the parent walk above to
+    // find. Reconstruct the class-scoped QN so a call inside the body attributes to
+    // the Method node instead of falling back to the File node.
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        const char *ool =
+            cbm_cpp_out_of_line_method_qn(a, func_node, source, project, rel_path, name);
+        if (ool) {
+            return ool;
         }
     }
 

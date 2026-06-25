@@ -50,6 +50,24 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
+// C++/CUDA: out-of-line method definitions name the function with a qualified
+// declarator (`Foo::bar`, or `ns::Foo::bar`). Return the immediate enclosing
+// class name (the scope segment directly left of the function name, e.g. "Foo"),
+// or NULL when the declarator is unqualified (a plain free function). Shared by
+// the defs extractor (to scope the Method node's QN) and the calls extractor (to
+// build the matching enclosing-function QN) so a call inside an out-of-line
+// definition attributes to the Method rather than the File node (#438 follow-up).
+char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode func_node, const char *source);
+
+// Class-scoped QN ("<classQN>.<name>") for a C++/CUDA out-of-line method
+// definition, or NULL when `func_node` is not one (plain free function / inline
+// method). `name` is the already-resolved function name. Both call extractors use
+// this so a call inside the body attributes to the Method node, matching the QN
+// the defs extractor builds from cbm_cpp_out_of_line_parent_class.
+const char *cbm_cpp_out_of_line_method_qn(CBMArena *a, TSNode func_node, const char *source,
+                                          const char *project, const char *rel_path,
+                                          const char *name);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 

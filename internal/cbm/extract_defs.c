@@ -458,56 +458,6 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
     return null_node;
 }
 
-// C++/CUDA: out-of-line method definitions name the function with a qualified
-// declarator (`Foo::bar`, or `ns::Foo::bar`). Return the immediate enclosing
-// class name (the scope segment directly left of the function name, e.g. "Foo"),
-// or NULL when the declarator is unqualified (a plain free function). Without
-// this, an out-of-line definition — whose class body lives declaration-only in a
-// header — would be recorded as a free Function with no link to its class.
-static char *cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
-    // Descend the declarator chain to its qualified_identifier, if any.
-    TSNode qid = {0};
-    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
-    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
-        const char *dk = ts_node_type(decl);
-        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            qid = decl;
-            break;
-        }
-        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
-            inner = ts_node_named_child(decl, 0);
-        }
-        if (ts_node_is_null(inner)) {
-            break;
-        }
-        decl = inner;
-    }
-    if (ts_node_is_null(qid)) {
-        return NULL;
-    }
-    // The qualified_identifier's `scope` is the parent. For a nested scope
-    // (`ns::Foo`) descend through its `name` field to the innermost segment so
-    // the direct parent ("Foo") is returned, not the outer namespace.
-    TSNode scope = ts_node_child_by_field_name(qid, TS_FIELD("scope"));
-    if (ts_node_is_null(scope)) {
-        return NULL;
-    }
-    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT; depth++) {
-        const char *sk = ts_node_type(scope);
-        if (strcmp(sk, "qualified_identifier") != 0 && strcmp(sk, "scoped_identifier") != 0) {
-            break;
-        }
-        TSNode name = ts_node_child_by_field_name(scope, TS_FIELD("name"));
-        if (ts_node_is_null(name)) {
-            break;
-        }
-        scope = name;
-    }
-    char *text = cbm_node_text(a, scope, source);
-    return (text && text[0]) ? text : NULL;
-}
-
 // R: resolve function_definition name from parent binary_operator lhs.
 static TSNode resolve_r_func_name(TSNode node) {
     TSNode parent = ts_node_parent(node);
@@ -2747,7 +2697,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // class node QN computed the same way) so DEFINES_METHOD edges resolve.
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
         strcmp(ts_node_type(node), "function_definition") == 0) {
-        char *scope_name = cpp_out_of_line_parent_class(a, node, ctx->source);
+        char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, scope_name);
             def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
